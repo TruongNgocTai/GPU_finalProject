@@ -123,7 +123,7 @@ void sortByHost(const uint32_t * in, uint32_t * out, int n)
     printf("Time of sortByHost: %.3f ms\n\n", timer.Elapsed());
 }
 
-__global__ void computeHist(uint32_t * in, int * hist, int n, int nBins, int bit)
+__global__ void computeHist(uint32_t * in, int n, int * hist, int nBins, int bit)
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < n) {
@@ -148,7 +148,7 @@ __global__ void computeHist(uint32_t * in, int * hist, int n, int nBins, int bit
 }
 
 // Compute hist by device
-void computeHistByDevice(uint32_t * in, int * hist, int n, int nBins, int bit, int blkSize) 
+void computeHistByDevice(uint32_t * in, int n, int * hist, int nBins, int bit, int blkSize) 
 {
     // Allocate device memories
     uint32_t *d_in;
@@ -161,7 +161,7 @@ void computeHistByDevice(uint32_t * in, int * hist, int n, int nBins, int bit, i
     CHECK(cudaMemcpy(d_in, in, sizeof(uint32_t) * n, cudaMemcpyHostToDevice));
 
     // Call kernel to scan within each block's input data
-    computeHist<<<numBlks, blkSize>>>(d_in, d_hist, n, nBins, bit);
+    computeHist<<<numBlks, blkSize>>>(d_in, n, d_hist, nBins, bit);
     cudaDeviceSynchronize();
     CHECK(cudaGetLastError());
 
@@ -173,103 +173,7 @@ void computeHistByDevice(uint32_t * in, int * hist, int n, int nBins, int bit, i
     CHECK(cudaFree(d_hist));
 }
 
-__global__ void scanBlks(int * in, int * out, int n, int * blkSums)
-{
-    // TODO
-	// 1. Each block loads data from GMEM to SMEM
-    extern __shared__ int s_data[];
-    int i1 = blockIdx.x * 2 * blockDim.x + threadIdx.x;
-    int i2 = i1 + blockDim.x;
-    if (i1 < n)
-        s_data[threadIdx.x] = i1 == 0 ? 0 : in[i1-1];
-    if (i2 < n)
-        s_data[threadIdx.x + blockDim.x] = in[i2-1];
-    __syncthreads();
-
-    // 2. Each block does scan with data on SMEM
-    // 2.1. Reduction phase
-    for (int stride = 1; stride < 2 * blockDim.x; stride *= 2)
-    {
-        int s_dataIdx = (threadIdx.x + 1) * 2 * stride - 1; // To avoid warp divergence
-        if (s_dataIdx < 2 * blockDim.x)
-            s_data[s_dataIdx] += s_data[s_dataIdx - stride];
-        __syncthreads();
-    }
-    // 2.2. Post-reduction phase
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
-    {
-        int s_dataIdx = (threadIdx.x + 1) * 2 * stride - 1 + stride; // Wow
-        if (s_dataIdx < 2 * blockDim.x)
-            s_data[s_dataIdx] += s_data[s_dataIdx - stride];
-        __syncthreads();
-    }
-
-    // 3. Each block writes results from SMEM to GMEM
-    if (i1 < n)
-        out[i1] = s_data[threadIdx.x];
-    if (i2 < n)
-        out[i2] = s_data[threadIdx.x + blockDim.x];
-
-    if (blkSums != NULL && threadIdx.x == 0)
-        blkSums[blockIdx.x] = s_data[2 * blockDim.x - 1];
-}
-
-__global__ void addPrevSum(int * blkSumsScan, int * blkScans, int n)
-{
-	int i = blockIdx.x * blockDim.x + threadIdx.x + blockDim.x;
-	if (i < n)
-	{
-		blkScans[i] += blkSumsScan[blockIdx.x];
-	}
-}
-
-// Scan by device
-void scanByDevice(int * in, int * out, int n, int blkSize)
-{
-    // Allocate device memories
-    int *d_in, *d_out;
-    size_t bytes = n * sizeof(int);
-    CHECK(cudaMalloc(&d_in, bytes));
-    CHECK(cudaMalloc(&d_out, bytes));
-    int blkDataSize;
-    blkDataSize = 2 * blkSize;
-    int * d_blkSums;
-    int numBlks = (n - 1) / blkDataSize + 1;
-    CHECK(cudaMalloc(&d_blkSums, numBlks * sizeof(int)));
-    
-    // Copy data to device memories
-    CHECK(cudaMemcpy(d_in, in, bytes, cudaMemcpyHostToDevice));
-
-    // Call kernel to scan within each block's input data
-    scanBlks<<<numBlks, blkSize, blkDataSize * sizeof(int)>>>(d_in, d_out, n, d_blkSums);
-    cudaDeviceSynchronize();
-    CHECK(cudaGetLastError());
-    
-    // Scan "d_blkSums" (by host)
-    int * blkSums;
-    blkSums = (int *)malloc(numBlks * sizeof(int));
-    CHECK(cudaMemcpy(blkSums, d_blkSums, numBlks * sizeof(int), cudaMemcpyDeviceToHost));
-    for (int i = 1; i < numBlks; i++)
-        blkSums[i] += blkSums[i-1];
-    CHECK(cudaMemcpy(d_blkSums, blkSums, numBlks * sizeof(int), cudaMemcpyHostToDevice));
-    free(blkSums);
-    
-    // Call kernel to add block's previous sum to block's scan result
-    printf("numBlks: %d, blkDataSize: %d\n", numBlks, blkDataSize);
-    addPrevSum<<<numBlks - 1, blkDataSize>>>(d_blkSums, d_out, n);
-    cudaDeviceSynchronize();
-    CHECK(cudaGetLastError());
-
-    // Copy result from device memories
-    CHECK(cudaMemcpy(out, d_out, bytes, cudaMemcpyDeviceToHost));
-        
-    // Free device memories
-    CHECK(cudaFree(d_in));
-    CHECK(cudaFree(d_out));
-    CHECK(cudaFree(d_blkSums));
-}
-
-__global__ void scatter(uint32_t * in, int * histScan, uint32_t * out, int n, int nBins, int bit)
+__global__ void scatter(uint32_t * in, uint32_t * out, int n, int * histScan, int nBins, int bit)
 {
     int idx = blockIdx.x * blockDim.x;
     if (threadIdx.x == 0) {
@@ -284,7 +188,7 @@ __global__ void scatter(uint32_t * in, int * histScan, uint32_t * out, int n, in
     }
 }
 
-void scatterByDevice(uint32_t * in, int * histScan, uint32_t * out, int n, int nBins, int bit, int blkSize)
+void scatterByDevice(uint32_t * in, uint32_t * out, int n, int * histScan, int nBins, int bit, int blkSize)
 {
     // Allocate device memories
     uint32_t *d_in, *d_out;
@@ -299,7 +203,7 @@ void scatterByDevice(uint32_t * in, int * histScan, uint32_t * out, int n, int n
     CHECK(cudaMemcpy(d_histScan, histScan, sizeof(int) * nBins * numBlks, cudaMemcpyHostToDevice));
 
     // Call kernel to scan within each block's input data
-    scatter<<<numBlks, blkSize>>>(d_in, d_histScan, d_out, n, nBins, bit);
+    scatter<<<numBlks, blkSize>>>(d_in, d_out, n, d_histScan, nBins, bit);
     cudaDeviceSynchronize();
     CHECK(cudaGetLastError());
 
@@ -313,7 +217,7 @@ void scatterByDevice(uint32_t * in, int * histScan, uint32_t * out, int n, int n
 }
 
 // Parallel Radix Sort with k bit
-void sortByDevice(const uint32_t * in, uint32_t * out, int n, int blkSize)
+void sortByDeviceLv1(const uint32_t * in, uint32_t * out, int n, int blkSize)
 {
 	GpuTimer timer; 
     timer.Start();
@@ -334,7 +238,7 @@ void sortByDevice(const uint32_t * in, uint32_t * out, int n, int blkSize)
     {
     	// Compute histogram
     	memset(hist, 0, nBins * numBlks * sizeof(int));
-        computeHistByDevice(src, hist, n, nBins, bit, blkSize);
+        computeHistByDevice(src, n, hist, nBins, bit, blkSize);
 
         int curScan = 0;
         for (int binIdx = 0; binIdx < nBins; binIdx++) {
@@ -346,7 +250,7 @@ void sortByDevice(const uint32_t * in, uint32_t * out, int n, int blkSize)
         };
 
     	// Scatter
-    	scatterByDevice(src, histScan, dst, n, nBins, bit, blkSize);
+    	scatterByDevice(src, dst, n, histScan, nBins, bit, blkSize);
 
     	// Swap src and dst
     	uint32_t * temp = src;
@@ -359,16 +263,6 @@ void sortByDevice(const uint32_t * in, uint32_t * out, int n, int blkSize)
     
     timer.Stop();
     printf("Time of sortByDevice: %.3f ms\n\n", timer.Elapsed());
-}
-
-bool checkCorrectness(uint32_t * out, uint32_t * correctOut, int n)
-{
-    for (int i = 0; i < n; i++)
-        if (out[i] != correctOut[i]) {
-            printf("%d\n", i);
-            return false;
-        }
-    return true;
 }
 
 void printDeviceInfo()
@@ -415,8 +309,8 @@ int main(int argc, char ** argv)
     sortByHost(in, correctOut, n);
     
     // SORT BY DEVICE
-    sortByDevice(in, out, n, blockSize);
-    if (checkCorrectness(out, correctOut, n) == false)
+    sortByDeviceLv1(in, out, n, blockSize);
+    if (checkCorrectInt32(out, correctOut, n) == false)
     	printf("sortByDevice is INCORRECT!\n\n");;
 
     // FREE MEMORIES

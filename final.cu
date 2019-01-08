@@ -1,5 +1,9 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/generate.h>
 
 #define CHECK(call)                                                            \
 {                                                                              \
@@ -17,9 +21,11 @@ struct GpuTimer
 {
     cudaEvent_t start;
     cudaEvent_t stop;
+    float elapsed;
 
     GpuTimer()
     {
+        elapsed = 0;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
     }
@@ -38,13 +44,14 @@ struct GpuTimer
     void Stop()
     {
         cudaEventRecord(stop, 0);
+        float timer;
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&timer, start, stop);
+        elapsed += timer;
     }
 
     float Elapsed()
     {
-        float elapsed;
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&elapsed, start, stop);
         return elapsed;
     }
 };
@@ -123,6 +130,144 @@ void sortByHost(const uint32_t * in, uint32_t * out, int n)
     printf("Time of sortByHost: %.3f ms\n\n", timer.Elapsed());
 }
 
+__global__ void computeHist(uint32_t * in, int n, int * hist, int nBins, int bit)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < n) {
+        int bin = (in[idx] >> bit) & (nBins - 1);
+        int histIdx = blockIdx.x * nBins + bin;
+        atomicAdd(&hist[histIdx], 1);
+    }
+}
+
+// Compute hist by device
+void computeHistByDevice(uint32_t * in, int n, int * hist, int nBins, int bit, int blkSize) 
+{
+    // Allocate device memories
+    uint32_t *d_in;
+    int *d_hist;
+    int numBlks = (n - 1) / blkSize + 1;
+    CHECK(cudaMalloc(&d_in, sizeof(uint32_t) * n));
+    CHECK(cudaMalloc(&d_hist, sizeof(int) * nBins * numBlks));
+    
+    // Copy data to device memories
+    CHECK(cudaMemcpy(d_in, in, sizeof(uint32_t) * n, cudaMemcpyHostToDevice));
+
+    // Call kernel to scan within each block's input data
+    computeHist<<<numBlks, blkSize>>>(d_in, n, d_hist, nBins, bit);
+    cudaDeviceSynchronize();
+    CHECK(cudaGetLastError());
+
+    // Copy result from device memories
+    CHECK(cudaMemcpy(hist, d_hist, sizeof(int) * nBins * numBlks, cudaMemcpyDeviceToHost));
+        
+    // Free device memories
+    CHECK(cudaFree(d_in));
+    CHECK(cudaFree(d_hist));
+}
+
+__global__ void scatter(uint32_t * in, uint32_t * out, int n, int * histScan, int nBins, int bit)
+{
+    int idx = blockIdx.x * blockDim.x;
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < blockDim.x; i++){
+            if (idx + i < n) {
+                int bin = (in[idx + i] >> bit) & (nBins - 1);
+                int histIdx = blockIdx.x * nBins + bin;
+                out[histScan[histIdx]] = in[idx + i];
+                histScan[histIdx]++;
+            }
+        }
+    }
+}
+
+void scatterByDevice(uint32_t * in, uint32_t * out, int n, int * histScan, int nBins, int bit, int blkSize)
+{
+    // Allocate device memories
+    uint32_t *d_in, *d_out;
+    int *d_histScan;
+    int numBlks = (n - 1) / blkSize + 1;
+    CHECK(cudaMalloc(&d_in, sizeof(uint32_t) * n));
+    CHECK(cudaMalloc(&d_histScan, sizeof(int) * nBins * numBlks));
+    CHECK(cudaMalloc(&d_out, sizeof(uint32_t) * n));
+
+    // Copy data to device memories
+    CHECK(cudaMemcpy(d_in, in, sizeof(uint32_t) * n, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_histScan, histScan, sizeof(int) * nBins * numBlks, cudaMemcpyHostToDevice));
+
+    // Call kernel to scan within each block's input data
+    scatter<<<numBlks, blkSize>>>(d_in, d_out, n, d_histScan, nBins, bit);
+    cudaDeviceSynchronize();
+    CHECK(cudaGetLastError());
+
+    // Copy result from device memories
+    CHECK(cudaMemcpy(out, d_out, sizeof(uint32_t) * n, cudaMemcpyDeviceToHost));
+        
+    // Free device memories
+    CHECK(cudaFree(d_in));
+    CHECK(cudaFree(d_histScan));
+    CHECK(cudaFree(d_out));
+}
+
+// Parallel Radix Sort with k bit
+void sortByDeviceLv1(const uint32_t * in, uint32_t * out, int n, int blkSize, int nBits)
+{
+    GpuTimer timer, computeHistTimer, scanTimer, scatterTimer; 
+    timer.Start();
+
+    //int nBits = 4; // Assume: nBits in {1, 2, 4, 8, 16, 32}
+    int nBins = 1 << nBits; // 2^nBits
+
+    int numBlks = (n - 1) / blkSize + 1;
+
+    int * hist = (int *)malloc(nBins * numBlks * sizeof(int));
+    int * histScan = (int *)malloc(nBins * numBlks * sizeof(int));
+
+    uint32_t * src = (uint32_t *)malloc(n * sizeof(uint32_t));
+    memcpy(src, in, n * sizeof(uint32_t));
+    uint32_t * dst = out;
+
+    for (int bit = 0; bit < sizeof(uint32_t) * 8; bit += nBits)
+    {
+    	// Compute histogram
+        computeHistTimer.Start();
+    	memset(hist, 0, nBins * numBlks * sizeof(int));
+        computeHistByDevice(src, n, hist, nBins, bit, blkSize);
+        computeHistTimer.Stop();
+
+        scanTimer.Start();
+        int curScan = 0;
+        for (int binIdx = 0; binIdx < nBins; binIdx++) {
+            for (int blkIdx = 0; blkIdx < numBlks; blkIdx++) {
+                int histIdx = blkIdx * nBins + binIdx;
+                histScan[histIdx] = curScan;
+                curScan += hist[histIdx];
+            }
+        };
+        scanTimer.Stop();
+
+    	// Scatter
+        scatterTimer.Start();
+    	scatterByDevice(src, dst, n, histScan, nBins, bit, blkSize);
+        scatterTimer.Stop();
+
+    	// Swap src and dst
+    	uint32_t * temp = src;
+    	src = dst;
+    	dst = temp;
+    }
+
+    // Copy result from src to out
+    memcpy(out, src, n * sizeof(uint32_t));
+    
+    timer.Stop();
+    printf("Time of sortByDevice Level 1: %.3f ms\n", timer.Elapsed());
+    printf("Time of compute hist: %.3f ms\n", computeHistTimer.Elapsed());
+    printf("Time of scan hist: %.3f ms\n", scanTimer.Elapsed());
+    printf("Time of scatter hist: %.3f ms\n", scatterTimer.Elapsed());
+    printf("\n");
+}
+
 __global__ void computeHistLocalSort(uint32_t * in, int n, int * hist, int nBits, int bit) 
 {
     int nBins = 1 << nBits; // 2^nBits
@@ -175,35 +320,16 @@ __global__ void computeHistLocalSort(uint32_t * in, int n, int * hist, int nBits
             __syncthreads();
 
             s_data[baseHistIdx + threadIdx.x] = rank;
-            s_data[baseCopyIdx + threadIdx.x] = 0;
-            __syncthreads();
             
             // 2.4. Local scatter
             s_data[baseCopyIdx + s_data[baseHistIdx + threadIdx.x]] = s_data[threadIdx.x];
             __syncthreads();
             s_data[threadIdx.x] = s_data[baseCopyIdx + threadIdx.x];
             __syncthreads();
-            
-            if (threadIdx.x == 0 && blockIdx.x == 0) {
-                for (int i = 1; i < blockSize; i++){
-                    int bin = (s_data[i] >> (bit+b)) & 1;
-                    int lastbin = (s_data[i-1] >> (bit+b)) & 1;
-    
-                    if (bin < lastbin) {
-                        if (blockIdx.x == 0) {
-                            printf("\n-----\nDM.%d - %d - %d < %d\n", b, i, bin, lastbin);
-                        }
-                        break;
-                    }
-                }
-            }
-            __syncthreads();
-            
         }
 
         // 3. Copy value to host
         in[idx] = s_data[threadIdx.x];
-        __syncthreads();
         
         // 4. Compute hist
         int bin = (s_data[threadIdx.x] >> bit) & (nBins - 1);
@@ -296,12 +422,12 @@ void scatterLocalSortByDevice(uint32_t * in, uint32_t * out, int n, int * hist, 
 }
 
 // Parallel Radix Sort with k bit
-void sortByDeviceLv2(const uint32_t * in, uint32_t * out, int n, int blkSize)
+void sortByDeviceLv2(const uint32_t * in, uint32_t * out, int n, int blkSize, int nBits)
 {
-	GpuTimer timer; 
+	GpuTimer timer, computeHistTimer, scanTimer, scatterTimer; 
     timer.Start();
 
-    int nBits = 4; // Assume: nBits in {1, 2, 4, 8, 16, 32}
+    //int nBits = 4; // Assume: nBits in {1, 2, 4, 8, 16, 32}
     int nBins = 1 << nBits; // 2^nBits
 
     int numBlks = (n - 1) / blkSize + 1;
@@ -316,9 +442,12 @@ void sortByDeviceLv2(const uint32_t * in, uint32_t * out, int n, int blkSize)
     for (int bit = 0; bit < sizeof(uint32_t) * 8; bit += nBits)
     {
     	// Compute histogram
+        computeHistTimer.Start();
     	memset(hist, 0, nBins * numBlks * sizeof(int));
         computeHistLocalSortByDevice(src, n, hist, nBits, bit, blkSize);
+        computeHistTimer.Stop();
 
+        scanTimer.Start();
         int curScan = 0;
         for (int binIdx = 0; binIdx < nBins; binIdx++) {
             for (int blkIdx = 0; blkIdx < numBlks; blkIdx++) {
@@ -327,9 +456,12 @@ void sortByDeviceLv2(const uint32_t * in, uint32_t * out, int n, int blkSize)
                 curScan += hist[histIdx];
             }
         }
+        scanTimer.Stop();
 
-    	// Scatter
+        // Scatter
+        scatterTimer.Start();
     	scatterLocalSortByDevice(src, dst, n, hist, histScan, nBins, bit, blkSize);
+        scatterTimer.Stop();
 
     	// Swap src and dst
     	uint32_t * temp = src;
@@ -341,7 +473,26 @@ void sortByDeviceLv2(const uint32_t * in, uint32_t * out, int n, int blkSize)
     memcpy(out, src, n * sizeof(uint32_t));
     
     timer.Stop();
-    printf("Time of sortByDevice Level 2: %.3f ms\n\n", timer.Elapsed());
+    printf("Time of sortByDevice Level 2: %.3f ms\n", timer.Elapsed());
+    printf("Time of compute hist: %.3f ms\n", computeHistTimer.Elapsed());
+    printf("Time of scan hist: %.3f ms\n", scanTimer.Elapsed());
+    printf("Time of scatter hist: %.3f ms\n", scatterTimer.Elapsed());
+    printf("\n");
+}
+
+// Parallel Radix Sort with k = 1 bit
+void sortByDevice(const uint32_t * in, uint32_t * out, int n, int blockSize)
+{
+	GpuTimer timer; 
+    timer.Start();
+	
+	// TODO
+    thrust::device_vector<uint32_t> dv_out(in, in + n);
+    thrust::sort(dv_out.begin(), dv_out.end());
+    thrust::copy(dv_out.begin(), dv_out.end(), out);
+    
+	timer.Stop();
+    printf("Time of sortByDevice by thrust: %.3f ms\n\n", timer.Elapsed());
 }
 
 void printDeviceInfo()
@@ -381,16 +532,30 @@ int main(int argc, char ** argv)
 
     // DETERMINE BLOCK SIZE
     int blockSize = 512; // Default 
-    if (argc == 2)
+    int nBits = 4;
+    if (argc >= 2)
         blockSize = atoi(argv[1]);
+
+    if (argc == 3)
+        nBits = atoi(argv[2]);
 
     // SORT BY HOST
     sortByHost(in, correctOut, n);
     
-    // SORT BY DEVICE
-    sortByDeviceLv2(in, out, n, blockSize);
+    // SORT BY DEVICE LEVEL 1
+    sortByDeviceLv1(in, out, n, blockSize, nBits);
     if (checkCorrectInt32(out, correctOut, n) == false)
-    	printf("sortByDevice is INCORRECT!\n\n");;
+        printf("sortByDevice is INCORRECT!\n\n");
+
+    // SORT BY DEVICE LEVEL 2
+    sortByDeviceLv2(in, out, n, blockSize, nBits);
+    if (checkCorrectInt32(out, correctOut, n) == false)
+        printf("sortByDevice is INCORRECT!\n\n");
+        
+    // SORT BY DEVICE by THRUST
+    sortByDevice(in, out, n, blockSize);
+    if (checkCorrectInt32(out, correctOut, n) == false)
+    	printf("sortByDevice is INCORRECT!\n\n");
 
     // FREE MEMORIES
     free(in);
